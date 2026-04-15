@@ -1,0 +1,80 @@
+// firestore.rules
+//
+// Deploy with:   firebase deploy --only firestore:rules
+//
+// Key rules:
+//   - Users can only access their own documents
+//   - Watch creation is blocked from the client — must go through the backend API
+//     (which enforces the 3-active-watch limit)
+//   - Alert documents are write-protected — only the backend service account writes them
+//   - Everything else is denied by default
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Users ─────────────────────────────────────────────────────────────────
+    match /users/{userId} {
+
+      // Users can read and update their own profile (FCM token, notification prefs, etc.)
+      allow read: if isOwner(userId);
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId);
+      allow delete: if false;
+
+      // ── Watches ───────────────────────────────────────────────────────────
+      match /watches/{watchId} {
+
+        // Reading watches is fine from the app
+        allow read: if isOwner(userId);
+
+        // Updates (pause/resume/edit) are allowed from the app.
+        // The backend PATCH /watches/:id endpoint also performs these,
+        // but direct Firestore updates work too for simple field changes.
+        allow update: if isOwner(userId) && onlyUpdatesAllowedWatchFields();
+
+        // Deletion is allowed from the app
+        allow delete: if isOwner(userId);
+
+        // Creation is BLOCKED on the client.
+        // The Flutter app must call POST /watches on the backend,
+        // which validates the 3-active-watch limit before writing.
+        allow create: if false;
+
+        // ── Alerts ────────────────────────────────────────────────────────
+        match /alerts/{alertId} {
+          // Users can read their own alerts
+          allow read: if isOwner(userId);
+
+          // Users can mark alerts as seen
+          allow update: if isOwner(userId) && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['seen']);
+
+          // Users can delete individual alerts
+          allow delete: if isOwner(userId);
+
+          // Only the backend service account creates new alerts
+          allow create: if false;
+        }
+      }
+    }
+
+    // Deny everything else by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+
+  // ── Helper functions ───────────────────────────────────────────────────────
+
+  function isOwner(userId) {
+    return request.auth != null && request.auth.uid == userId;
+  }
+
+  // Prevent the client from changing sensitive fields like campgroundId or createdAt
+  function onlyUpdatesAllowedWatchFields() {
+    return request.resource.data.diff(resource.data)
+      .affectedKeys()
+      .hasOnly(['status', 'siteNumber', 'checkIn', 'checkOut', 'notificationsEnabled']);
+  }
+}
