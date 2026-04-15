@@ -320,6 +320,15 @@ async function checkAvailability(watch, attempt = 0) {
 //   [{ id, name, region, mapId }]
 //
 // Used by the GET /campgrounds endpoint in server.js.
+//
+// Why we load the main page first:
+//   The Ontario Parks search API requires session cookies that are only set
+//   when the browser visits reservations.ontarioparks.ca.  Calling the API
+//   URL directly from a cold Puppeteer page returns an empty array because
+//   the server sees an unauthenticated/sessionless request.
+//   Loading the main page first establishes the session, then we call the
+//   search API via page.evaluate(fetch(...)) so the cookies are sent
+//   automatically (same-origin, credentials: 'include').
 
 async function searchCampgrounds(query) {
   console.log(`[Scraper] Searching campgrounds: "${query}"`);
@@ -327,10 +336,45 @@ async function searchCampgrounds(query) {
   let browser;
   try {
     browser = await launchBrowser();
-    const data = await fetchJson(browser, buildSearchUrl(query));
+    const page = await newPage(browser);
+
+    // Step 1 — establish session by loading the booking home page
+    console.log('[Scraper] Loading Ontario Parks home page to establish session...');
+    await page.goto(BASE_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: PAGE_TIMEOUT,
+    });
+
+    // Step 2 — call the search API from within the page context so that
+    //           all session cookies are included in the request automatically
+    const searchUrl = buildSearchUrl(query);
+    console.log(`[Scraper] Fetching search API: ${searchUrl}`);
+
+    const data = await page.evaluate(async (url) => {
+      try {
+        const res = await fetch(url, {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json, text/plain, */*',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          credentials: 'include',
+        });
+        if (!res.ok) {
+          console.error('Search API returned', res.status);
+          return null;
+        }
+        return await res.json();
+      } catch (e) {
+        console.error('fetch error:', e.message);
+        return null;
+      }
+    }, searchUrl);
+
+    await page.close().catch(() => {});
 
     if (!Array.isArray(data)) {
-      console.warn('[Scraper] Search response was not an array');
+      console.warn('[Scraper] Search response was not an array:', JSON.stringify(data)?.slice(0, 200));
       return [];
     }
 
