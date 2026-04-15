@@ -99,12 +99,39 @@ async function newPage(browser) {
 
 // Fetch a URL and parse its body as JSON, using an existing browser page.
 // Returns parsed JSON on success, null on any error.
+//
+// Why response interception instead of document.body.innerText:
+//   Headless Chromium renders JSON API URLs through its built-in JSON viewer,
+//   which wraps the payload in a shadow-DOM structure.  innerText on that
+//   structure does NOT return the raw JSON — JSON.parse silently throws and
+//   the function returns null.  Intercepting the raw HTTP response body avoids
+//   Chrome's rendering pipeline entirely and is the most reliable approach.
 async function fetchJson(browser, url) {
   const page = await newPage(browser);
+  let capturedJson = null;
+
+  // Primary: capture the raw response before Chrome processes it
+  page.on('response', async (response) => {
+    try {
+      if (response.url() === url && response.status() === 200) {
+        capturedJson = await response.json();
+      }
+    } catch {
+      // Body was not valid JSON — will fall back below
+    }
+  });
+
   try {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: PAGE_TIMEOUT });
-    const text = await page.evaluate(() => document.body.innerText);
-    return JSON.parse(text);
+
+    if (capturedJson !== null) return capturedJson;
+
+    // Fallback: Chrome JSON viewer wraps content in a <pre> tag
+    const text = await page.evaluate(() => {
+      const pre = document.querySelector('pre');
+      return pre ? pre.innerText : document.body.innerText;
+    });
+    return JSON.parse(text.trim());
   } catch (err) {
     console.warn(`[Scraper] fetchJson failed for ${url}: ${err.message}`);
     return null;
