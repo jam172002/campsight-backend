@@ -1,18 +1,17 @@
 // scraper.js
 //
-// Puppeteer-based scraper for the Ontario Parks reservation website.
-// Visits https://reservations.ontarioparks.ca and reads real availability.
+// Scraper for the Ontario Parks reservation website.
 //
-// Strategy 1 (primary):
-//   Calls the internal availability API endpoint directly and parses JSON.
-//   This is fast and reliable when the API is reachable.
+// searchCampgrounds — plain HTTPS (no browser):
+//   GET /api/resourceLocation returns all ~129 parks as JSON without any
+//   session cookies or authentication.  A simple https.get() is enough.
+//   This is fast (~300 ms) and avoids Puppeteer startup overhead entirely.
 //
-// Strategy 2 (fallback):
-//   Intercepts XHR network responses from the booking results page,
-//   capturing the same availability data that the page itself uses.
-//   More robust than CSS-selector scraping because it doesn't depend on
-//   class names that change with every front-end build.
+// checkAvailability — Puppeteer (browser required):
+//   Strategy 1: calls the internal availability API directly and parses JSON.
+//   Strategy 2: intercepts XHR responses from the booking results page.
 
+const https    = require('https');
 const puppeteer = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium');
 
@@ -326,73 +325,85 @@ async function checkAvailability(watch, attempt = 0) {
 }
 
 // ── searchCampgrounds ─────────────────────────────────────────────────────────
+// ── fetchAllParks ─────────────────────────────────────────────────────────────
+// Fetches the full park list via a plain HTTPS request — no browser needed.
+// GET /api/resourceLocation is a public, unauthenticated JSON endpoint that
+// the Ontario Parks SPA loads on every page visit.
+
+function fetchAllParks() {
+  return new Promise((resolve, reject) => {
+    const req = https.get(RESOURCE_LOCATION_URL, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+    }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          return reject(new Error(`/api/resourceLocation returned ${res.statusCode}`));
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (e) {
+          reject(new Error(`/api/resourceLocation body is not JSON: ${body.slice(0, 100)}`));
+        }
+      });
+    });
+    req.setTimeout(15000, () => {
+      req.destroy();
+      reject(new Error('/api/resourceLocation request timed out'));
+    });
+    req.on('error', reject);
+  });
+}
+
+// ── searchCampgrounds ─────────────────────────────────────────────────────────
 // Public API. Returns an array:
 //   [{ id, name, region, mapId }]
 //
 // Used by the GET /campgrounds endpoint in server.js.
 //
-// Why we fetch all parks and filter locally:
-//   The Ontario Parks reservation site (Angular SPA) no longer exposes a
-//   per-query search endpoint.  It now loads the full list of ~129 parks from
-//   GET /api/resourceLocation on every page load, then filters client-side.
-//   We mirror that behaviour: fetch the full list once, filter by the query
-//   string, and return the matches.  The server caches the results per-query
-//   for 1 hour so Puppeteer only has to run once per unique search term.
-//
-// Response shape per park:
-//   {
-//     resourceLocationId: number,
-//     localizedValues: [{ cultureName, shortName, fullName, ... }],
-//     region: string,          // e.g. "Ontario"
-//     rootMapId: number,       // used as mapId in booking URLs
-//     transactionLocationId: number,
-//     ...
-//   }
+// No Puppeteer — plain HTTPS fetch (~300 ms) + client-side filter.
+// The server caches results per-query for 1 hour.
 
 async function searchCampgrounds(query) {
   console.log(`[Scraper] Searching campgrounds: "${query}"`);
 
-  let browser;
-  try {
-    browser = await launchBrowser();
-    const apiData = await fetchJson(browser, RESOURCE_LOCATION_URL);
+  const apiData = await fetchAllParks();
 
-    if (!Array.isArray(apiData)) {
-      console.warn('[Scraper] /api/resourceLocation did not return an array:', JSON.stringify(apiData)?.slice(0, 200));
-      return [];
-    }
-
-    console.log(`[Scraper] Loaded ${apiData.length} parks — filtering for "${query}"...`);
-
-    const q = query.toLowerCase();
-
-    const results = apiData
-      .map((item) => {
-        // Park name lives in localizedValues; prefer English full name
-        const en = item.localizedValues?.find((v) => v.cultureName === 'en-CA')
-          || item.localizedValues?.[0];
-        const fullName = en?.fullName || en?.shortName || '';
-        const shortName = en?.shortName || '';
-        return {
-          id: String(item.resourceLocationId || ''),
-          name: fullName || shortName,
-          region: item.region || '',
-          mapId: String(item.rootMapId || '-2147483648'),
-        };
-      })
-      .filter((item) =>
-        item.name.toLowerCase().includes(q) ||
-        item.region.toLowerCase().includes(q)
-      );
-
-    console.log(`[Scraper] Search returned ${results.length} campground(s)`);
-    return results;
-  } catch (err) {
-    console.error('[Scraper] searchCampgrounds error:', err.message);
+  if (!Array.isArray(apiData)) {
+    console.warn('[Scraper] /api/resourceLocation did not return an array');
     return [];
-  } finally {
-    if (browser) await browser.close().catch(() => {});
   }
+
+  console.log(`[Scraper] Loaded ${apiData.length} parks — filtering for "${query}"...`);
+
+  const q = query.toLowerCase();
+
+  const results = apiData
+    .map((item) => {
+      // Park name lives in localizedValues; prefer English full name
+      const en = item.localizedValues?.find((v) => v.cultureName === 'en-CA')
+        || item.localizedValues?.[0];
+      return {
+        id: String(item.resourceLocationId || ''),
+        name: en?.fullName || en?.shortName || '',
+        region: item.region || '',
+        mapId: String(item.rootMapId || '-2147483648'),
+      };
+    })
+    .filter((item) =>
+      item.name.toLowerCase().includes(q) ||
+      item.region.toLowerCase().includes(q)
+    );
+
+  console.log(`[Scraper] Search returned ${results.length} campground(s)`);
+  return results;
 }
 
 module.exports = { checkAvailability, searchCampgrounds, formatDate, buildBookingUrl };
