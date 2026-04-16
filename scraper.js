@@ -65,19 +65,29 @@ function buildAvailabilityApiUrl(campgroundId, mapId, checkIn, checkOut) {
   return `${BASE_URL}/api/availability/map?${params.toString()}`;
 }
 
-// Build the campground search API URL
-function buildSearchUrl(query) {
-  const params = new URLSearchParams({
-    resourceLocationId: '-2147483648',
-    searchString: query,
-    resourceLocationTypeId: '1',
-  });
-  return `${BASE_URL}/api/resourcelocation/search?${params.toString()}`;
-}
+// URL that returns the full list of all Ontario Parks locations (129 parks).
+// Ontario Parks no longer exposes a per-query search endpoint — the SPA loads
+// the complete list on page load and filters client-side.
+const RESOURCE_LOCATION_URL = `${BASE_URL}/api/resourceLocation`;
 
 // ── Browser ───────────────────────────────────────────────────────────────────
 
 async function launchBrowser() {
+  // On Windows (local dev) @sparticuz/chromium ships a Linux binary that won't
+  // run. Use the locally-installed Chrome instead.
+  const isWindows = process.platform === 'win32';
+  const localChrome = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+
+  if (isWindows) {
+    return puppeteer.launch({
+      executablePath: localChrome,
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      defaultViewport: { width: 1280, height: 800 },
+    });
+  }
+
+  // Production (Linux / Render.com) — use the serverless Chromium binary
   return puppeteer.launch({
     args: chromium.args,
     defaultViewport: chromium.defaultViewport,
@@ -321,14 +331,23 @@ async function checkAvailability(watch, attempt = 0) {
 //
 // Used by the GET /campgrounds endpoint in server.js.
 //
-// Why we load the main page first:
-//   The Ontario Parks search API requires session cookies that are only set
-//   when the browser visits reservations.ontarioparks.ca.  Calling the API
-//   URL directly from a cold Puppeteer page returns an empty array because
-//   the server sees an unauthenticated/sessionless request.
-//   Loading the main page first establishes the session, then we call the
-//   search API via page.evaluate(fetch(...)) so the cookies are sent
-//   automatically (same-origin, credentials: 'include').
+// Why we fetch all parks and filter locally:
+//   The Ontario Parks reservation site (Angular SPA) no longer exposes a
+//   per-query search endpoint.  It now loads the full list of ~129 parks from
+//   GET /api/resourceLocation on every page load, then filters client-side.
+//   We mirror that behaviour: fetch the full list once, filter by the query
+//   string, and return the matches.  The server caches the results per-query
+//   for 1 hour so Puppeteer only has to run once per unique search term.
+//
+// Response shape per park:
+//   {
+//     resourceLocationId: number,
+//     localizedValues: [{ cultureName, shortName, fullName, ... }],
+//     region: string,          // e.g. "Ontario"
+//     rootMapId: number,       // used as mapId in booking URLs
+//     transactionLocationId: number,
+//     ...
+//   }
 
 async function searchCampgrounds(query) {
   console.log(`[Scraper] Searching campgrounds: "${query}"`);
@@ -336,54 +355,35 @@ async function searchCampgrounds(query) {
   let browser;
   try {
     browser = await launchBrowser();
-    const page = await newPage(browser);
+    const apiData = await fetchJson(browser, RESOURCE_LOCATION_URL);
 
-    // Step 1 — establish session by loading the booking home page
-    console.log('[Scraper] Loading Ontario Parks home page to establish session...');
-    await page.goto(BASE_URL, {
-      waitUntil: 'domcontentloaded',
-      timeout: PAGE_TIMEOUT,
-    });
-
-    // Step 2 — call the search API from within the page context so that
-    //           all session cookies are included in the request automatically
-    const searchUrl = buildSearchUrl(query);
-    console.log(`[Scraper] Fetching search API: ${searchUrl}`);
-
-    const data = await page.evaluate(async (url) => {
-      try {
-        const res = await fetch(url, {
-          method: 'GET',
-          headers: {
-            'Accept': 'application/json, text/plain, */*',
-            'X-Requested-With': 'XMLHttpRequest',
-          },
-          credentials: 'include',
-        });
-        if (!res.ok) {
-          console.error('Search API returned', res.status);
-          return null;
-        }
-        return await res.json();
-      } catch (e) {
-        console.error('fetch error:', e.message);
-        return null;
-      }
-    }, searchUrl);
-
-    await page.close().catch(() => {});
-
-    if (!Array.isArray(data)) {
-      console.warn('[Scraper] Search response was not an array:', JSON.stringify(data)?.slice(0, 200));
+    if (!Array.isArray(apiData)) {
+      console.warn('[Scraper] /api/resourceLocation did not return an array:', JSON.stringify(apiData)?.slice(0, 200));
       return [];
     }
 
-    const results = data.map((item) => ({
-      id: String(item.resourceLocationId || ''),
-      name: item.name || '',
-      region: item.regionName || '',
-      mapId: String(item.defaultMapId || '-2147483648'),
-    }));
+    console.log(`[Scraper] Loaded ${apiData.length} parks — filtering for "${query}"...`);
+
+    const q = query.toLowerCase();
+
+    const results = apiData
+      .map((item) => {
+        // Park name lives in localizedValues; prefer English full name
+        const en = item.localizedValues?.find((v) => v.cultureName === 'en-CA')
+          || item.localizedValues?.[0];
+        const fullName = en?.fullName || en?.shortName || '';
+        const shortName = en?.shortName || '';
+        return {
+          id: String(item.resourceLocationId || ''),
+          name: fullName || shortName,
+          region: item.region || '',
+          mapId: String(item.rootMapId || '-2147483648'),
+        };
+      })
+      .filter((item) =>
+        item.name.toLowerCase().includes(q) ||
+        item.region.toLowerCase().includes(q)
+      );
 
     console.log(`[Scraper] Search returned ${results.length} campground(s)`);
     return results;
