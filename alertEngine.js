@@ -3,7 +3,7 @@
 // Core engine that:
 //   1. Reads all active watches from Firestore (collectionGroup query)
 //   2. Calls the scraper to check real Ontario Parks availability
-//   3. Deduplicates alerts (no repeat for same site within 30 minutes)
+//   3. Deduplicates alerts (one notification per same site + dates)
 //   4. Writes alert documents to Firestore
 //   5. Sends FCM push notifications to the user's device
 
@@ -11,7 +11,6 @@ const admin = require('firebase-admin');
 const { getFirestore, getMessaging } = require('./firebase');
 const { checkAvailability } = require('./scraper');
 
-const DEDUP_MINUTES = 30; // don't re-alert for the same site within 30 min
 const BATCH_SIZE = 3;     // process 3 watches at a time (memory-safe on free tier)
 const BATCH_DELAY = 5000; // ms between batches — avoids hammering Ontario Parks
 
@@ -87,25 +86,17 @@ async function sendPushNotification(fcmToken, alert) {
 }
 
 // ── Deduplication check ────────────────────────────────────────────────────────
-// Returns true if we already sent an alert for this exact site + dates recently.
-async function isRecentlyAlerted(watchRef, siteId, checkIn, checkOut) {
-  const cutoff = new Date(Date.now() - DEDUP_MINUTES * 60 * 1000);
-
-  const recentQuery = await watchRef
+// Returns true if we have EVER already sent an alert for this exact site + dates.
+async function hasAlreadyAlerted(watchRef, siteId, checkIn, checkOut) {
+  const existingQuery = await watchRef
     .collection('alerts')
     .where('siteId', '==', siteId)
     .where('checkIn', '==', checkIn)
     .where('checkOut', '==', checkOut)
-    .orderBy('detectedAt', 'desc')
     .limit(1)
     .get();
 
-  if (recentQuery.empty) return false;
-
-  const lastAlert = recentQuery.docs[0].data();
-  const lastAlertTime = lastAlert.detectedAt?.toDate?.() || new Date(0);
-
-  return lastAlertTime > cutoff;
+  return !existingQuery.empty;
 }
 
 // ── Process a single watch ────────────────────────────────────────────────────
@@ -150,8 +141,8 @@ async function processWatch(watchDoc, userId) {
     const shouldNotify = fcmToken && globalNotificationsEnabled && watchNotificationsEnabled;
 
     for (const site of availableSites) {
-      // Skip if we already alerted for this site + dates recently
-      const alreadyAlerted = await isRecentlyAlerted(
+      // Skip if we already alerted for this exact site + dates
+      const alreadyAlerted = await hasAlreadyAlerted(
         watchRef,
         site.siteId,
         site.checkIn,
@@ -159,7 +150,9 @@ async function processWatch(watchDoc, userId) {
       );
 
       if (alreadyAlerted) {
-        console.log(`[AlertEngine] Skipping duplicate for site ${site.siteId}`);
+        console.log(
+          `[AlertEngine] Skipping duplicate for site ${site.siteId} (${site.checkIn} → ${site.checkOut})`
+        );
         continue;
       }
 

@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where chrome:*)",
+      "Bash(where chromium:*)",
+      "Bash(reg query:*)",
+      "Bash(npm install:*)",
+      "Bash(node test-scraper.js \"Algonquin\")",
+      "mcp__Claude_in_Chrome__tabs_context_mcp",
+      "Bash(node find-endpoint.js)",
+      "Bash(node spy-network.js)",
+      "Bash(node inspect-endpoint.js)",
+      "Bash(node test-scraper.js \"Killbear\")",
+      "Bash(node test-direct-fetch.js)"
+    ]
+  }
+}
