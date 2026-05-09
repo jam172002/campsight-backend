@@ -172,12 +172,24 @@ async function fetchJson(browser, url) {
 function parseAvailabilityResponse(apiData, watch, checkIn, checkOut) {
   if (!apiData || !apiData.resourceAvailabilities) return null;
 
+  // Number of nights the user wants to stay
+  const msPerDay = 24 * 60 * 60 * 1000;
+  const expectedNights = Math.round(
+    (new Date(checkOut + 'T00:00:00Z') - new Date(checkIn + 'T00:00:00Z')) / msPerDay
+  );
+
   const available = [];
 
   for (const [siteId, dateMap] of Object.entries(apiData.resourceAvailabilities)) {
     // All dates in the range must be available (code 0)
     const codes = Object.values(dateMap);
     if (codes.length === 0) continue;
+
+    // The API must return a code for every expected night.
+    // If it returns fewer entries than nights, it may be omitting unavailable dates,
+    // which would make allAvailable a false positive.
+    if (expectedNights > 0 && codes.length < expectedNights) continue;
+
     const allAvailable = codes.every((code) => code === 0 || code === '0');
     if (!allAvailable) continue;
 

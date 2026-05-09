@@ -11,7 +11,16 @@
       "Bash(node spy-network.js)",
       "Bash(node inspect-endpoint.js)",
       "Bash(node test-scraper.js \"Killbear\")",
-      "Bash(node test-direct-fetch.js)"
+      "Bash(node test-direct-fetch.js)",
+      "Bash(grep -rn --include=\"*.dart\" \"\\\\\\\\\\\\\\\\$\" lib/)",
+      "Bash(grep -v \"//\")",
+      "Bash(grep -rn --include=\"*.dart\" \"'\\\\\\\\\\\\$\\\\${\" lib/)",
+      "Bash(grep -rn --include=\"*.dart\" '\"\\\\\\\\\\\\$\\\\${' lib/)",
+      "Bash(grep -rn --include=\"*.dart\" '\"\\\\\\\\\\\\$ ' lib/)",
+      "Bash(grep -rn --include=\"*.dart\" \"'\\\\\\\\\\\\$ \" lib/)",
+      "Bash(grep -rn --include=\"*.dart\" \"dollar\\\\|USD\\\\|\\\\\\\\\\\\\\\\\\\\$[0-9]\\\\|'\\\\\\\\\\\\$\\\\|'\\\\\\\\\\\\$ \\\\|\\\\\"\\\\\\\\\\\\$\\\\|\\\\\"\\\\\\\\\\\\$ \" lib/)",
+      "Bash(grep -v \"print\\\\|//\")",
+      "Bash(grep -rn --include=\"*.dart\" \"'\\\\\\\\\\\\$\\\\|'\\\\\\\\\\\\$ \\\\|\\\\\"\\\\\\\\\\\\$\\\\|\\\\\"\\\\\\\\\\\\$ \\\\|USD\\\\|amount\\\\|price\\\\|Price\\\\|Amount\" lib/features/user/profile/)"
     ]
   }
 }
