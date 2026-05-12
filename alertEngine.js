@@ -11,8 +11,8 @@ const admin = require('firebase-admin');
 const { getFirestore, getMessaging } = require('./firebase');
 const { checkAvailability } = require('./scraper');
 
-const BATCH_SIZE = 3;     // process 3 watches at a time (memory-safe on free tier)
-const BATCH_DELAY = 5000; // ms between batches — avoids hammering Ontario Parks
+const BATCH_SIZE = 3;
+const BATCH_DELAY = 5000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -73,7 +73,6 @@ async function sendPushNotification(fcmToken, alert) {
   } catch (error) {
     console.error('[AlertEngine] FCM send error:', error.message);
 
-    // Stale token — caller will clean it up
     if (
       error.code === 'messaging/invalid-registration-token' ||
       error.code === 'messaging/registration-token-not-registered'
@@ -86,17 +85,25 @@ async function sendPushNotification(fcmToken, alert) {
 }
 
 // ── Deduplication check ────────────────────────────────────────────────────────
-// Returns true if we have EVER already sent an alert for this exact site + dates.
+// Permanent dedupe: once an alert is written for the exact site + dates,
+// do not send the same alert again.
 async function hasAlreadyAlerted(watchRef, siteId, checkIn, checkOut) {
-  const existingQuery = await watchRef
-    .collection('alerts')
-    .where('siteId', '==', siteId)
-    .where('checkIn', '==', checkIn)
-    .where('checkOut', '==', checkOut)
-    .limit(1)
-    .get();
+  try {
+    const existingQuery = await watchRef
+      .collection('alerts')
+      .where('siteId', '==', siteId)
+      .where('checkIn', '==', checkIn)
+      .where('checkOut', '==', checkOut)
+      .limit(1)
+      .get();
 
-  return !existingQuery.empty;
+    return !existingQuery.empty;
+  } catch (err) {
+    console.error('[AlertEngine] Dedup check failed:', err.message);
+
+    // Safer choice: if dedupe check fails, do not send duplicate/spam alerts.
+    return true;
+  }
 }
 
 // ── Process a single watch ────────────────────────────────────────────────────
@@ -108,17 +115,13 @@ async function processWatch(watchDoc, userId) {
   console.log(`[AlertEngine] Processing watch ${watch.id} (${watch.campgroundName})`);
 
   try {
-    // Scrape real availability from Ontario Parks
     const availableSites = await checkAvailability(watch);
 
-    // ── FIX: Use admin.firestore.FieldValue.serverTimestamp() ─────────────────
-    // The old code used db.constructor.Timestamp which does not exist and silently
-    // failed, meaning lastChecked was never updated on the dashboard.
     await watchRef.update({
       lastChecked: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    if (availableSites.length === 0) {
+    if (!Array.isArray(availableSites) || availableSites.length === 0) {
       console.log(`[AlertEngine] No availability for watch ${watch.id}`);
       return;
     }
@@ -127,7 +130,6 @@ async function processWatch(watchDoc, userId) {
       `[AlertEngine] 🎉 ${availableSites.length} site(s) available for watch ${watch.id}`
     );
 
-    // Load the user record for FCM token + notification preferences
     const userDoc = await db.collection('users').doc(userId).get();
     if (!userDoc.exists) {
       console.warn(`[AlertEngine] User ${userId} not found — skipping notification`);
@@ -138,10 +140,18 @@ async function processWatch(watchDoc, userId) {
     const fcmToken = userData.fcmToken || null;
     const globalNotificationsEnabled = userData.notificationsEnabled !== false;
     const watchNotificationsEnabled = watch.notificationsEnabled !== false;
-    const shouldNotify = fcmToken && globalNotificationsEnabled && watchNotificationsEnabled;
+    const shouldNotify =
+      Boolean(fcmToken) &&
+      globalNotificationsEnabled &&
+      watchNotificationsEnabled;
+
+    if (!shouldNotify) {
+      console.log(
+        `[AlertEngine] Notification skipped. token=${Boolean(fcmToken)}, global=${globalNotificationsEnabled}, watch=${watchNotificationsEnabled}`
+      );
+    }
 
     for (const site of availableSites) {
-      // Skip if we already alerted for this exact site + dates
       const alreadyAlerted = await hasAlreadyAlerted(
         watchRef,
         site.siteId,
@@ -156,7 +166,6 @@ async function processWatch(watchDoc, userId) {
         continue;
       }
 
-      // Write alert to Firestore
       const alertRef = await watchRef.collection('alerts').add({
         campgroundId: watch.campgroundId,
         campgroundName: watch.campgroundName,
@@ -171,7 +180,6 @@ async function processWatch(watchDoc, userId) {
 
       console.log(`[AlertEngine] Alert written: ${alertRef.id}`);
 
-      // Send push notification
       if (shouldNotify) {
         const fcmResult = await sendPushNotification(fcmToken, {
           watchId: watch.id,
@@ -183,7 +191,6 @@ async function processWatch(watchDoc, userId) {
           bookingUrl: site.bookingUrl,
         });
 
-        // Token is stale — remove it to prevent repeated failures
         if (fcmResult?.isInvalidToken) {
           console.warn(`[AlertEngine] Removing stale FCM token for user ${userId}`);
           await userDoc.ref.update({
@@ -193,7 +200,6 @@ async function processWatch(watchDoc, userId) {
       }
     }
   } catch (err) {
-    // Log but don't rethrow — one failing watch must not block the others
     console.error(`[AlertEngine] Error on watch ${watch.id}:`, err.message);
   }
 }
@@ -207,7 +213,6 @@ async function runAlertEngine() {
   console.log(`[AlertEngine] Run started at ${new Date().toISOString()}`);
 
   try {
-    // Fetch all active watches across all users in a single query
     const activeWatchesSnap = await db
       .collectionGroup('watches')
       .where('status', '==', 'active')
@@ -222,11 +227,9 @@ async function runAlertEngine() {
 
     const watchDocs = activeWatchesSnap.docs;
 
-    // Process in small batches to stay within Render free tier memory limits
     for (let i = 0; i < watchDocs.length; i += BATCH_SIZE) {
       const batch = watchDocs.slice(i, i + BATCH_SIZE);
 
-      // Path structure: users/{userId}/watches/{watchId}
       await Promise.all(
         batch.map((doc) => {
           const userId = doc.ref.parent.parent.id;

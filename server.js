@@ -231,47 +231,124 @@ app.post('/watches', watchLimiter, verifyFirebaseToken, async (req, res) => {
   }
 });
 
+
 // PATCH /watches/:watchId — update a watch (pause, resume, edit criteria)
 app.patch('/watches/:watchId', watchLimiter, verifyFirebaseToken, async (req, res) => {
   const db = getFirestore();
   const userId = req.userId;
   const { watchId } = req.params;
 
-  const allowedFields = ['status', 'siteNumber', 'checkIn', 'checkOut', 'notificationsEnabled'];
+  const allowedFields = [
+    'status',
+    'siteNumber',
+    'checkIn',
+    'checkOut',
+    'notificationsEnabled',
+  ];
+
   const updates = {};
+
   for (const field of allowedFields) {
-    if (req.body[field] !== undefined) updates[field] = req.body[field];
+    if (req.body[field] !== undefined) {
+      updates[field] = req.body[field];
+    }
   }
 
   if (Object.keys(updates).length === 0) {
-    return res.status(400).json({ error: 'No valid fields provided' });
+    return res.status(400).json({
+      error: 'No valid fields provided',
+    });
   }
 
   if (updates.status && !['active', 'paused'].includes(updates.status)) {
-    return res.status(400).json({ error: 'status must be "active" or "paused"' });
+    return res.status(400).json({
+      error: 'status must be "active" or "paused"',
+    });
   }
 
   try {
-    const watchRef = db.collection('users').doc(userId).collection('watches').doc(watchId);
+    const watchRef = db
+      .collection('users')
+      .doc(userId)
+      .collection('watches')
+      .doc(watchId);
+
     const snap = await watchRef.get();
-    if (!snap.exists) return res.status(404).json({ error: 'Watch not found' });
+
+    if (!snap.exists) {
+      return res.status(404).json({
+        error: 'Watch not found',
+      });
+    }
 
     // If resuming, re-check the 3-watch limit
-    if (updates.status === 'active' && snap.data().status !== 'active') {
-      const watchesRef = db.collection('users').doc(userId).collection('watches');
-      const activeSnap = await watchesRef.where('status', '==', 'active').get();
+    if (
+      updates.status === 'active' &&
+      snap.data().status !== 'active'
+    ) {
+      const watchesRef = db
+        .collection('users')
+        .doc(userId)
+        .collection('watches');
+
+      const activeSnap = await watchesRef
+        .where('status', '==', 'active')
+        .get();
+
       if (activeSnap.size >= 3) {
         return res.status(409).json({
-          error: 'Maximum of 3 active watches reached. Pause another watch first.',
+          error:
+            'Maximum of 3 active watches reached. Pause another watch first.',
         });
       }
     }
 
+    // Normalize site number
+    if (updates.siteNumber !== undefined) {
+      updates.siteNumber = updates.siteNumber
+        ? String(updates.siteNumber).trim()
+        : '';
+    }
+
+    // Validate edited dates
+    if (updates.checkIn || updates.checkOut) {
+      const current = snap.data();
+
+      const nextCheckIn = updates.checkIn || current.checkIn;
+      const nextCheckOut = updates.checkOut || current.checkOut;
+
+      const start = new Date(nextCheckIn);
+      const end = new Date(nextCheckOut);
+
+      if (isNaN(start) || isNaN(end)) {
+        return res.status(400).json({
+          error: 'Invalid date format — use YYYY-MM-DD',
+        });
+      }
+
+      if (start >= end) {
+        return res.status(400).json({
+          error: 'checkOut must be after checkIn',
+        });
+      }
+
+      updates.checkIn = nextCheckIn;
+      updates.checkOut = nextCheckOut;
+    }
+
     await watchRef.update(updates);
-    res.json({ message: 'Watch updated', watchId, updates });
+
+    res.json({
+      message: 'Watch updated',
+      watchId,
+      updates,
+    });
   } catch (err) {
     console.error('[Server] Update watch error:', err.message);
-    res.status(500).json({ error: 'Failed to update watch' });
+
+    res.status(500).json({
+      error: 'Failed to update watch',
+    });
   }
 });
 

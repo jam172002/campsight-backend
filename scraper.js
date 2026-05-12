@@ -3,21 +3,26 @@
 // Scraper for the Ontario Parks reservation website.
 //
 // searchCampgrounds — plain HTTPS (no browser):
-//   GET /api/resourceLocation returns all ~129 parks as JSON without any
-//   session cookies or authentication.  A simple https.get() is enough.
-//   This is fast (~300 ms) and avoids Puppeteer startup overhead entirely.
+//   GET /api/resourceLocation returns all parks as JSON without session cookies.
 //
-// checkAvailability — Puppeteer (browser required):
+// checkAvailability — Puppeteer:
 //   Strategy 1: calls the internal availability API directly and parses JSON.
 //   Strategy 2: intercepts XHR responses from the booking results page.
+//
+// IMPORTANT:
+//   Availability code 0 = available.
+//   Any other value = not available / booked / closed / restricted.
+//   We only return a site when EVERY required night is code 0.
 
-const https    = require('https');
+const https = require('https');
 const puppeteer = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium');
 
 const BASE_URL = 'https://reservations.ontarioparks.ca';
-const PAGE_TIMEOUT = 30000; // 30 seconds per page load
-const MAX_RETRIES = 2;      // retry transient failures up to this many times
+const PAGE_TIMEOUT = 30000;
+const MAX_RETRIES = 2;
+
+const RESOURCE_LOCATION_URL = `${BASE_URL}/api/resourceLocation`;
 
 // ── Utility ───────────────────────────────────────────────────────────────────
 
@@ -25,14 +30,46 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// Format a Date or Firestore Timestamp as YYYY-MM-DD
 function formatDate(date) {
+  if (!date) return '';
+
   const d = new Date(date);
+  if (Number.isNaN(d.getTime())) return '';
+
   return d.toISOString().split('T')[0];
 }
 
-// Build the Ontario Parks booking results URL for a campground + date range.
-// This URL is also used as the "Book Now" deep link sent in notifications.
+function dateRangeNights(checkIn, checkOut) {
+  const start = new Date(`${checkIn}T00:00:00Z`);
+  const end = new Date(`${checkOut}T00:00:00Z`);
+
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return [];
+
+  const dates = [];
+  const current = new Date(start);
+
+  while (current < end) {
+    dates.push(current.toISOString().split('T')[0]);
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+
+  return dates;
+}
+
+function normalizeSite(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/^site\s*/i, '')
+    .replace(/^campsite\s*/i, '')
+    .replace(/^0+/, '')
+    .trim();
+}
+
+function isZeroCode(code) {
+  return code === 0 || code === '0';
+}
+
 function buildBookingUrl(campgroundId, checkIn, checkOut, mapId) {
   const params = new URLSearchParams({
     resourceLocationId: campgroundId || '-2147483648',
@@ -41,16 +78,16 @@ function buildBookingUrl(campgroundId, checkIn, checkOut, mapId) {
     bookingCategoryId: '0',
     startDate: checkIn,
     endDate: checkOut,
-    nights: '1',
+    nights: String(dateRangeNights(checkIn, checkOut).length || 1),
     isReserving: 'true',
     equipmentId: '-32768',
     subEquipmentId: '-32768',
     partySize: '1',
   });
+
   return `${BASE_URL}/create-booking/results?${params.toString()}`;
 }
 
-// Build the direct availability API URL
 function buildAvailabilityApiUrl(campgroundId, mapId, checkIn, checkOut) {
   const params = new URLSearchParams({
     mapId: mapId || '-2147483648',
@@ -61,19 +98,13 @@ function buildAvailabilityApiUrl(campgroundId, mapId, checkIn, checkOut) {
     endDate: checkOut,
     partySize: '1',
   });
+
   return `${BASE_URL}/api/availability/map?${params.toString()}`;
 }
-
-// URL that returns the full list of all Ontario Parks locations (129 parks).
-// Ontario Parks no longer exposes a per-query search endpoint — the SPA loads
-// the complete list on page load and filters client-side.
-const RESOURCE_LOCATION_URL = `${BASE_URL}/api/resourceLocation`;
 
 // ── Browser ───────────────────────────────────────────────────────────────────
 
 async function launchBrowser() {
-  // On Windows (local dev) @sparticuz/chromium ships a Linux binary that won't
-  // run. Use the locally-installed Chrome instead.
   const isWindows = process.platform === 'win32';
   const localChrome = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
 
@@ -86,7 +117,6 @@ async function launchBrowser() {
     });
   }
 
-  // Production (Linux / Render.com) — use the serverless Chromium binary
   return puppeteer.launch({
     args: chromium.args,
     defaultViewport: chromium.defaultViewport,
@@ -95,38 +125,30 @@ async function launchBrowser() {
   });
 }
 
-// Create a new page with a realistic user agent
 async function newPage(browser) {
   const page = await browser.newPage();
+
   await page.setUserAgent(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   );
+
   await page.setViewport({ width: 1280, height: 800 });
+
   return page;
 }
 
-// Fetch a URL and parse its body as JSON, using an existing browser page.
-// Returns parsed JSON on success, null on any error.
-//
-// Why response interception instead of document.body.innerText:
-//   Headless Chromium renders JSON API URLs through its built-in JSON viewer,
-//   which wraps the payload in a shadow-DOM structure.  innerText on that
-//   structure does NOT return the raw JSON — JSON.parse silently throws and
-//   the function returns null.  Intercepting the raw HTTP response body avoids
-//   Chrome's rendering pipeline entirely and is the most reliable approach.
 async function fetchJson(browser, url) {
   const page = await newPage(browser);
   let capturedJson = null;
 
-  // Primary: capture the raw response before Chrome processes it
   page.on('response', async (response) => {
     try {
       if (response.url() === url && response.status() === 200) {
         capturedJson = await response.json();
       }
     } catch {
-      // Body was not valid JSON — will fall back below
+      // Ignore invalid/non-JSON response.
     }
   });
 
@@ -135,11 +157,11 @@ async function fetchJson(browser, url) {
 
     if (capturedJson !== null) return capturedJson;
 
-    // Fallback: Chrome JSON viewer wraps content in a <pre> tag
     const text = await page.evaluate(() => {
       const pre = document.querySelector('pre');
       return pre ? pre.innerText : document.body.innerText;
     });
+
     return JSON.parse(text.trim());
   } catch (err) {
     console.warn(`[Scraper] fetchJson failed for ${url}: ${err.message}`);
@@ -149,62 +171,67 @@ async function fetchJson(browser, url) {
   }
 }
 
-// ── Parse availability API response ──────────────────────────────────────────
-//
-// Ontario Parks availability API response shape:
-//   {
-//     resourceAvailabilities: {
-//       "<siteId>": { "<date>": <code>, ... },
-//       ...
-//     },
-//     resourceMap: {
-//       "<siteId>": { "name": "Site 001", ... },
-//       ...
-//     }
-//   }
-//
-// Availability codes:
-//   0  = Available
-//   1+ = Not available (reserved, closed, maintenance, etc.)
-//
-// A site is considered available only when ALL dates in the range are code 0.
+// ── Availability Parsing ──────────────────────────────────────────────────────
 
 function parseAvailabilityResponse(apiData, watch, checkIn, checkOut) {
-  if (!apiData || !apiData.resourceAvailabilities) return null;
+  if (!apiData || !apiData.resourceAvailabilities) {
+    console.warn('[Scraper] Invalid availability response: missing resourceAvailabilities');
+    return null;
+  }
 
-  // Number of nights the user wants to stay
-  const msPerDay = 24 * 60 * 60 * 1000;
-  const expectedNights = Math.round(
-    (new Date(checkOut + 'T00:00:00Z') - new Date(checkIn + 'T00:00:00Z')) / msPerDay
-  );
+  const requiredDates = dateRangeNights(checkIn, checkOut);
+
+  if (requiredDates.length === 0) {
+    console.warn(`[Scraper] Invalid date range: ${checkIn} → ${checkOut}`);
+    return [];
+  }
 
   const available = [];
+  const targetSite = normalizeSite(watch.siteNumber);
 
   for (const [siteId, dateMap] of Object.entries(apiData.resourceAvailabilities)) {
-    // All dates in the range must be available (code 0)
-    const codes = Object.values(dateMap);
-    if (codes.length === 0) continue;
+    if (!dateMap || typeof dateMap !== 'object') continue;
 
-    // The API must return a code for every expected night.
-    // If it returns fewer entries than nights, it may be omitting unavailable dates,
-    // which would make allAvailable a false positive.
-    if (expectedNights > 0 && codes.length < expectedNights) continue;
+    const resourceInfo = apiData.resourceMap?.[siteId] || {};
+    const siteName = resourceInfo.name || `Site ${siteId}`;
 
-    const allAvailable = codes.every((code) => code === 0 || code === '0');
-    if (!allAvailable) continue;
+    // Specific site filter.
+    // Handles:
+    //   user input: "12"
+    //   API name: "Site 012"
+    //   API id: "012"
+    if (targetSite) {
+      const normalizedSiteId = normalizeSite(siteId);
+      const normalizedSiteName = normalizeSite(siteName);
 
-    const siteName = apiData.resourceMap?.[siteId]?.name || `Site ${siteId}`;
-
-    // If the user requested a specific site number, filter to it
-    if (watch.siteNumber && watch.siteNumber !== '') {
-      const target = watch.siteNumber.toLowerCase();
-      if (
-        siteName.toLowerCase() !== target &&
-        siteId !== watch.siteNumber
-      ) {
+      if (normalizedSiteId !== targetSite && normalizedSiteName !== targetSite) {
         continue;
       }
     }
+
+    // Important false-alert fix:
+    // Check every required night by exact date key.
+    // Do NOT use Object.values(dateMap), because the API may contain extra dates,
+    // missing dates, or dates outside the user's requested range.
+    let allRequiredDatesAvailable = true;
+
+    for (const date of requiredDates) {
+      const code = dateMap[date];
+
+      // Missing date means unsafe/unknown, so treat as NOT available.
+      if (code === undefined || code === null) {
+        allRequiredDatesAvailable = false;
+        break;
+      }
+
+      // Only code 0 is available. Anything else means booked/unavailable.
+      if (!isZeroCode(code)) {
+        allRequiredDatesAvailable = false;
+        break;
+      }
+    }
+
+    if (!allRequiredDatesAvailable) continue;
 
     available.push({
       siteId,
@@ -218,81 +245,78 @@ function parseAvailabilityResponse(apiData, watch, checkIn, checkOut) {
   return available;
 }
 
-// ── Strategy 2: network interception ─────────────────────────────────────────
-//
-// Loads the booking results page and captures the availability API response
-// as it flies over the network — the same data Strategy 1 fetches directly,
-// but retrieved through the page's own request rather than a separate fetch.
-// This works even if the direct API URL requires a session cookie set by the
-// main page load.
+// ── Strategy 2: Network Interception ──────────────────────────────────────────
 
 async function checkAvailabilityViaInterception(browser, watch, checkIn, checkOut) {
   const apiPattern = /\/api\/availability\//;
   const bookingUrl = buildBookingUrl(watch.campgroundId, checkIn, checkOut, watch.mapId);
 
   let capturedData = null;
-
   const page = await newPage(browser);
 
   try {
-    // Listen for matching network responses and capture the JSON body
     page.on('response', async (response) => {
-      if (apiPattern.test(response.url()) && response.status() === 200) {
-        try {
+      try {
+        if (apiPattern.test(response.url()) && response.status() === 200) {
           const json = await response.json();
+
           if (json && json.resourceAvailabilities) {
             capturedData = json;
             console.log(`[Scraper] Intercepted availability response from ${response.url()}`);
           }
-        } catch {
-          // Response body was not JSON — ignore
         }
+      } catch {
+        // Ignore non-JSON or already-consumed response bodies.
       }
     });
 
     await page.goto(bookingUrl, { waitUntil: 'networkidle2', timeout: PAGE_TIMEOUT });
 
-    // Give the SPA a moment to fire any deferred requests
     await sleep(3000);
-
+  } catch (err) {
+    console.warn(`[Scraper] Interception failed: ${err.message}`);
   } finally {
     await page.close().catch(() => {});
   }
 
   if (!capturedData) return null;
+
   return parseAvailabilityResponse(capturedData, watch, checkIn, checkOut);
 }
 
 // ── checkAvailability ─────────────────────────────────────────────────────────
-// Public API. Returns an array of available sites:
-//   [{ siteId, siteName, checkIn, checkOut, bookingUrl }]
-//
-// Attempts Strategy 1, falls back to Strategy 2, retries on transient errors.
 
 async function checkAvailability(watch, attempt = 0) {
   const checkIn = formatDate(
     watch.checkIn?.toDate ? watch.checkIn.toDate() : watch.checkIn
   );
+
   const checkOut = formatDate(
     watch.checkOut?.toDate ? watch.checkOut.toDate() : watch.checkOut
   );
 
+  if (!checkIn || !checkOut) {
+    console.warn(`[Scraper] Watch ${watch.id} has invalid dates`);
+    return [];
+  }
+
   console.log(
     `[Scraper] Checking watch ${watch.id} — ${watch.campgroundName} ` +
-    `(${checkIn} → ${checkOut})${attempt > 0 ? ` [retry ${attempt}]` : ''}`
+      `(${checkIn} → ${checkOut})${attempt > 0 ? ` [retry ${attempt}]` : ''}`
   );
 
   let browser;
+
   try {
     browser = await launchBrowser();
 
-    // ── Strategy 1: direct API call ───────────────────────────────────────────
     const apiUrl = buildAvailabilityApiUrl(
       watch.campgroundId,
       watch.mapId,
       checkIn,
       checkOut
     );
+
     console.log(`[Scraper] Strategy 1 — ${apiUrl}`);
 
     const apiData = await fetchJson(browser, apiUrl);
@@ -303,9 +327,14 @@ async function checkAvailability(watch, attempt = 0) {
       return s1Results;
     }
 
-    // ── Strategy 2: network interception ─────────────────────────────────────
     console.log('[Scraper] Strategy 1 returned no data — falling back to interception');
-    const s2Results = await checkAvailabilityViaInterception(browser, watch, checkIn, checkOut);
+
+    const s2Results = await checkAvailabilityViaInterception(
+      browser,
+      watch,
+      checkIn,
+      checkOut
+    );
 
     if (s2Results !== null) {
       console.log(`[Scraper] Strategy 2 found ${s2Results.length} available site(s)`);
@@ -314,11 +343,9 @@ async function checkAvailability(watch, attempt = 0) {
 
     console.log('[Scraper] Both strategies returned no data — assuming no availability');
     return [];
-
   } catch (err) {
     console.error(`[Scraper] Error on watch ${watch.id}:`, err.message);
 
-    // Retry on transient errors (network blip, Puppeteer crash, etc.)
     if (attempt < MAX_RETRIES) {
       const delay = (attempt + 1) * 3000;
       console.log(`[Scraper] Retrying in ${delay}ms...`);
@@ -336,52 +363,56 @@ async function checkAvailability(watch, attempt = 0) {
   }
 }
 
-// ── searchCampgrounds ─────────────────────────────────────────────────────────
-// ── fetchAllParks ─────────────────────────────────────────────────────────────
-// Fetches the full park list via a plain HTTPS request — no browser needed.
-// GET /api/resourceLocation is a public, unauthenticated JSON endpoint that
-// the Ontario Parks SPA loads on every page visit.
+// ── Campground Search ─────────────────────────────────────────────────────────
 
 function fetchAllParks() {
   return new Promise((resolve, reject) => {
-    const req = https.get(RESOURCE_LOCATION_URL, {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'X-Requested-With': 'XMLHttpRequest',
+    const req = https.get(
+      RESOURCE_LOCATION_URL,
+      {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+            '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
       },
-    }, (res) => {
-      let body = '';
-      res.on('data', (chunk) => { body += chunk; });
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          return reject(new Error(`/api/resourceLocation returned ${res.statusCode}`));
-        }
-        try {
-          resolve(JSON.parse(body));
-        } catch (e) {
-          reject(new Error(`/api/resourceLocation body is not JSON: ${body.slice(0, 100)}`));
-        }
-      });
-    });
+      (res) => {
+        let body = '';
+
+        res.on('data', (chunk) => {
+          body += chunk;
+        });
+
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            return reject(
+              new Error(`/api/resourceLocation returned ${res.statusCode}`)
+            );
+          }
+
+          try {
+            resolve(JSON.parse(body));
+          } catch {
+            reject(
+              new Error(
+                `/api/resourceLocation body is not JSON: ${body.slice(0, 100)}`
+              )
+            );
+          }
+        });
+      }
+    );
+
     req.setTimeout(15000, () => {
       req.destroy();
       reject(new Error('/api/resourceLocation request timed out'));
     });
+
     req.on('error', reject);
   });
 }
-
-// ── searchCampgrounds ─────────────────────────────────────────────────────────
-// Public API. Returns an array:
-//   [{ id, name, region, mapId }]
-//
-// Used by the GET /campgrounds endpoint in server.js.
-//
-// No Puppeteer — plain HTTPS fetch (~300 ms) + client-side filter.
-// The server caches results per-query for 1 hour.
 
 async function searchCampgrounds(query) {
   console.log(`[Scraper] Searching campgrounds: "${query}"`);
@@ -395,13 +426,14 @@ async function searchCampgrounds(query) {
 
   console.log(`[Scraper] Loaded ${apiData.length} parks — filtering for "${query}"...`);
 
-  const q = query.toLowerCase();
+  const q = String(query || '').toLowerCase().trim();
 
   const results = apiData
     .map((item) => {
-      // Park name lives in localizedValues; prefer English full name
-      const en = item.localizedValues?.find((v) => v.cultureName === 'en-CA')
-        || item.localizedValues?.[0];
+      const en =
+        item.localizedValues?.find((v) => v.cultureName === 'en-CA') ||
+        item.localizedValues?.[0];
+
       return {
         id: String(item.resourceLocationId || ''),
         name: en?.fullName || en?.shortName || '',
@@ -409,13 +441,21 @@ async function searchCampgrounds(query) {
         mapId: String(item.rootMapId || '-2147483648'),
       };
     })
-    .filter((item) =>
-      item.name.toLowerCase().includes(q) ||
-      item.region.toLowerCase().includes(q)
-    );
+    .filter((item) => {
+      return (
+        item.name.toLowerCase().includes(q) ||
+        item.region.toLowerCase().includes(q)
+      );
+    });
 
   console.log(`[Scraper] Search returned ${results.length} campground(s)`);
+
   return results;
 }
 
-module.exports = { checkAvailability, searchCampgrounds, formatDate, buildBookingUrl };
+module.exports = {
+  checkAvailability,
+  searchCampgrounds,
+  formatDate,
+  buildBookingUrl,
+};
