@@ -70,7 +70,7 @@ function isZeroCode(code) {
   return code === 0 || code === '0';
 }
 
-function buildBookingUrl(campgroundId, checkIn, checkOut, mapId) {
+function buildBookingUrl(campgroundId, checkIn, checkOut, mapId, siteId) {
   const params = new URLSearchParams({
     resourceLocationId: campgroundId || '-2147483648',
     mapId: mapId || '-2147483648',
@@ -84,6 +84,8 @@ function buildBookingUrl(campgroundId, checkIn, checkOut, mapId) {
     subEquipmentId: '-32768',
     partySize: '1',
   });
+
+  if (siteId) params.set('resourceId', String(siteId));
 
   return `${BASE_URL}/create-booking/results?${params.toString()}`;
 }
@@ -138,33 +140,35 @@ async function newPage(browser) {
   return page;
 }
 
-async function fetchJson(browser, url) {
+// Strategy 1: establish a browser session on the main page, then call the
+// availability API from within the browser context so session cookies are
+// included.  Direct navigation to the API URL (old approach) returned a login
+// redirect with no JSON because the endpoint requires an active session.
+async function callAvailabilityApiWithSession(browser, apiUrl) {
   const page = await newPage(browser);
-  let capturedJson = null;
-
-  page.on('response', async (response) => {
-    try {
-      if (response.url() === url && response.status() === 200) {
-        capturedJson = await response.json();
-      }
-    } catch {
-      // Ignore invalid/non-JSON response.
-    }
-  });
 
   try {
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: PAGE_TIMEOUT });
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
 
-    if (capturedJson !== null) return capturedJson;
+    const data = await page.evaluate(async (url) => {
+      try {
+        const res = await fetch(url, {
+          headers: {
+            Accept: 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          credentials: 'include',
+        });
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      }
+    }, apiUrl);
 
-    const text = await page.evaluate(() => {
-      const pre = document.querySelector('pre');
-      return pre ? pre.innerText : document.body.innerText;
-    });
-
-    return JSON.parse(text.trim());
+    return data;
   } catch (err) {
-    console.warn(`[Scraper] fetchJson failed for ${url}: ${err.message}`);
+    console.warn(`[Scraper] callAvailabilityApiWithSession failed: ${err.message}`);
     return null;
   } finally {
     await page.close().catch(() => {});
@@ -238,7 +242,7 @@ function parseAvailabilityResponse(apiData, watch, checkIn, checkOut) {
       siteName,
       checkIn,
       checkOut,
-      bookingUrl: buildBookingUrl(watch.campgroundId, checkIn, checkOut, watch.mapId),
+      bookingUrl: buildBookingUrl(watch.campgroundId, checkIn, checkOut, watch.mapId, siteId),
     });
   }
 
@@ -248,7 +252,6 @@ function parseAvailabilityResponse(apiData, watch, checkIn, checkOut) {
 // ── Strategy 2: Network Interception ──────────────────────────────────────────
 
 async function checkAvailabilityViaInterception(browser, watch, checkIn, checkOut) {
-  const apiPattern = /\/api\/availability\//;
   const bookingUrl = buildBookingUrl(watch.campgroundId, checkIn, checkOut, watch.mapId);
 
   let capturedData = null;
@@ -257,12 +260,23 @@ async function checkAvailabilityViaInterception(browser, watch, checkIn, checkOu
   try {
     page.on('response', async (response) => {
       try {
-        if (apiPattern.test(response.url()) && response.status() === 200) {
+        const resUrl = response.url();
+
+        // Only accept the availability/map endpoint that matches our exact
+        // campground and date parameters.  The booking SPA can fire multiple
+        // /api/availability/* calls (calendar view, category checks, etc.) and
+        // capturing the wrong one caused false-positive alerts.
+        if (
+          resUrl.includes('/api/availability/map') &&
+          resUrl.includes(`resourceLocationId=${watch.campgroundId}`) &&
+          resUrl.includes(`startDate=${checkIn}`) &&
+          response.status() === 200
+        ) {
           const json = await response.json();
 
           if (json && json.resourceAvailabilities) {
             capturedData = json;
-            console.log(`[Scraper] Intercepted availability response from ${response.url()}`);
+            console.log(`[Scraper] Intercepted availability response from ${resUrl}`);
           }
         }
       } catch {
@@ -319,7 +333,7 @@ async function checkAvailability(watch, attempt = 0) {
 
     console.log(`[Scraper] Strategy 1 — ${apiUrl}`);
 
-    const apiData = await fetchJson(browser, apiUrl);
+    const apiData = await callAvailabilityApiWithSession(browser, apiUrl);
     const s1Results = parseAvailabilityResponse(apiData, watch, checkIn, checkOut);
 
     if (s1Results !== null) {

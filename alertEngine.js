@@ -85,23 +85,29 @@ async function sendPushNotification(fcmToken, alert) {
 }
 
 // ── Deduplication check ────────────────────────────────────────────────────────
-// Permanent dedupe: once an alert is written for the exact site + dates,
-// do not send the same alert again.
+// Time-based dedupe: suppress repeat alerts for the same site + dates within
+// 30 minutes.  After 30 minutes we re-alert — a site that opens, gets snapped
+// up, and opens again (new cancellation) should fire a second notification.
 async function hasAlreadyAlerted(watchRef, siteId, checkIn, checkOut) {
   try {
-    const existingQuery = await watchRef
+    const snap = await watchRef
       .collection('alerts')
       .where('siteId', '==', siteId)
       .where('checkIn', '==', checkIn)
       .where('checkOut', '==', checkOut)
+      .orderBy('detectedAt', 'desc')
       .limit(1)
       .get();
 
-    return !existingQuery.empty;
+    if (snap.empty) return false;
+
+    const lastAlertTime = snap.docs[0].data().detectedAt?.toDate?.();
+    if (!lastAlertTime) return false;
+
+    const minutesSince = (Date.now() - lastAlertTime.getTime()) / 60000;
+    return minutesSince < 30;
   } catch (err) {
     console.error('[AlertEngine] Dedup check failed:', err.message);
-
-    // Safer choice: if dedupe check fails, do not send duplicate/spam alerts.
     return true;
   }
 }
